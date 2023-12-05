@@ -7,6 +7,7 @@ use DTApi\Http\Requests;
 use DTApi\Models\Distance;
 use Illuminate\Http\Request;
 use DTApi\Repository\BookingRepository;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Class BookingController
@@ -14,19 +15,13 @@ use DTApi\Repository\BookingRepository;
  */
 class BookingController extends Controller
 {
-
-    /**
-     * @var BookingRepository
-     */
-    protected $repository;
-
     /**
      * BookingController constructor.
      * @param BookingRepository $bookingRepository
      */
-    public function __construct(BookingRepository $bookingRepository)
-    {
-        $this->repository = $bookingRepository;
+    public function __construct(
+        protected BookingRepository $repository
+    ) {
     }
 
     /**
@@ -35,11 +30,18 @@ class BookingController extends Controller
      */
     public function index(Request $request)
     {
-        if ($user_id = $request->get('user_id')) {
+        $userId = $request->get('user_id');
+        $authenticatedUserType = $request->__authenticatedUser?->user_type;
 
-            $response = $this->repository->getUsersJobs($user_id);
-        } elseif ($request->__authenticatedUser->user_type == env('ADMIN_ROLE_ID') || $request->__authenticatedUser->user_type == env('SUPERADMIN_ROLE_ID')) {
+        if ($userId) {
+            $response = $this->repository->getUsersJobs($userId);
+        } elseif (
+            $authenticatedUserType == config('filename.ADMIN_ROLE_ID') ||
+            $authenticatedUserType == config('filename.SUPERADMIN_ROLE_ID')
+        ) {
             $response = $this->repository->getAll($request);
+        } else {
+            $response = [];
         }
 
         return response($response);
@@ -51,7 +53,7 @@ class BookingController extends Controller
      */
     public function show($id)
     {
-        $job = $this->repository->with('translatorJobRel.user')->find($id);
+        $job = $this->repository->with('translatorJobRel.user')->findOrFail($id);
 
         return response($job);
     }
@@ -62,9 +64,25 @@ class BookingController extends Controller
      */
     public function store(Request $request)
     {
-        $data = $request->all();
+        $authenticatedUser = $request->__authenticatedUser;
 
-        $response = $this->repository->store($request->__authenticatedUser, $data);
+        if ($authenticatedUser?->user_type != config('filename.CUSTOMER_ROLE_ID')) {
+            return response(['status' => 'fail', 'message' => 'Translator can not create booking']);
+        }
+
+        $data = $request->validate([
+            'from_language_id' => ['required'],
+            'immediate' => ['required', 'boolean'],
+            'due_date' => ['required_if:immediate,false', 'date_format:Y-m-d'],
+            'due_time' => ['required_if:immediate,false', 'date_format:H:i'],
+            'customer_phone_type' => ['required_if:immediate,false', 'boolean'],
+            'customer_physical_type' => ['required_if:immediate,false', 'boolean'],
+            'duration' => ['required'],
+            'job_for' => ['array', 'required'],
+            'job_for.*' => ['required', 'min:1'],
+        ]);
+
+        $response = $this->repository->store($authenticatedUser, $data);
 
         return response($response);
     }
@@ -89,9 +107,7 @@ class BookingController extends Controller
      */
     public function immediateJobEmail(Request $request)
     {
-        $adminSenderEmail = config('app.adminemail');
         $data = $request->all();
-
         $response = $this->repository->storeJobEmail($data);
 
         return response($response);
@@ -103,9 +119,8 @@ class BookingController extends Controller
      */
     public function getHistory(Request $request)
     {
-        if ($user_id = $request->get('user_id')) {
-
-            $response = $this->repository->getUsersJobsHistory($user_id, $request);
+        if ($userId = $request->get('user_id')) {
+            $response = $this->repository->getUsersJobsHistory($userId, $request);
             return response($response);
         }
 
@@ -157,7 +172,6 @@ class BookingController extends Controller
     public function endJob(Request $request)
     {
         $data = $request->all();
-
         $response = $this->repository->endJob($data);
 
         return response($response);
@@ -166,7 +180,6 @@ class BookingController extends Controller
     public function customerNotCall(Request $request)
     {
         $data = $request->all();
-
         $response = $this->repository->customerNotCall($data);
 
         return response($response);
@@ -178,9 +191,7 @@ class BookingController extends Controller
      */
     public function getPotentialJobs(Request $request)
     {
-        $data = $request->all();
         $user = $request->__authenticatedUser;
-
         $response = $this->repository->getPotentialJobs($user);
 
         return response($response);
@@ -190,59 +201,42 @@ class BookingController extends Controller
     {
         $data = $request->all();
 
-        if (isset($data['distance']) && $data['distance'] != "") {
-            $distance = $data['distance'];
-        } else {
-            $distance = "";
-        }
-        if (isset($data['time']) && $data['time'] != "") {
-            $time = $data['time'];
-        } else {
-            $time = "";
-        }
-        if (isset($data['jobid']) && $data['jobid'] != "") {
-            $jobid = $data['jobid'];
+        $distance = $data['distance'] ?? null;
+        $time = $data['time'] ?? null;
+        $jobid = $data['jobid'] ?? null;
+        $session = $data['session_time'] ?? null;
+
+        $isFlagged = $data['flagged'] ?? false;
+        $isManuallyHandled = $data['manually_handled'] ?? false;
+        $isByAdmin = $data['by_admin'] ?? false;
+
+        $admincomment = $data['admincomment'] ?? null;
+
+        if ($isFlagged && !$admincomment) {
+            return "Please, add comment";
         }
 
-        if (isset($data['session_time']) && $data['session_time'] != "") {
-            $session = $data['session_time'];
-        } else {
-            $session = "";
-        }
+        $flagged = $isFlagged ? 'yes' : 'no';
+        $manually_handled = $isManuallyHandled ? 'yes' : 'no';
+        $by_admin = $isByAdmin ? 'yes' : 'no';
 
-        if ($data['flagged'] == 'true') {
-            if ($data['admincomment'] == '') return "Please, add comment";
-            $flagged = 'yes';
-        } else {
-            $flagged = 'no';
-        }
+        DB::transaction(function () use ($time, $distance, $jobid, $session, $flagged, $manually_handled, $by_admin, $admincomment) {
+            if ($time || $distance) {
+                Distance::where('job_id', '=', $jobid)
+                    ->update(['distance' => $distance, 'time' => $time]);
+            }
 
-        if ($data['manually_handled'] == 'true') {
-            $manually_handled = 'yes';
-        } else {
-            $manually_handled = 'no';
-        }
-
-        if ($data['by_admin'] == 'true') {
-            $by_admin = 'yes';
-        } else {
-            $by_admin = 'no';
-        }
-
-        if (isset($data['admincomment']) && $data['admincomment'] != "") {
-            $admincomment = $data['admincomment'];
-        } else {
-            $admincomment = "";
-        }
-        if ($time || $distance) {
-
-            $affectedRows = Distance::where('job_id', '=', $jobid)->update(array('distance' => $distance, 'time' => $time));
-        }
-
-        if ($admincomment || $session || $flagged || $manually_handled || $by_admin) {
-
-            $affectedRows1 = Job::where('id', '=', $jobid)->update(array('admin_comments' => $admincomment, 'flagged' => $flagged, 'session_time' => $session, 'manually_handled' => $manually_handled, 'by_admin' => $by_admin));
-        }
+            if ($admincomment || $session || $flagged || $manually_handled || $by_admin) {
+                Job::where('id', '=', $jobid)
+                    ->update([
+                        'admin_comments' => $admincomment,
+                        'flagged' => $flagged,
+                        'session_time' => $session,
+                        'manually_handled' => $manually_handled,
+                        'by_admin' => $by_admin
+                    ]);
+            }
+        });
 
         return response('Record updated!');
     }
